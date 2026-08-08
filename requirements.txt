@@ -1,0 +1,14 @@
+# producer stage (in use now)
+# kafka-python 2.0.2 is broken on Python 3.12+ (vendored six.moves import bug);
+# kafka-python-ng is a maintained drop-in fork exposing the same `kafka` module.
+kafka-python-ng==2.2.3
+python-dotenv==1.1.0
+
+# storage stage (db_writer.py / mcp server) — psycopg2-binary already present in host env
+psycopg2-binary==2.9.12
+
+# explain stage (llm_explainer.py, in use now)
+openai==2.53.0
+
+# mcp stage (risk_status_server.py, in use now)
+mcp==2.0.0

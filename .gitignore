@@ -1,0 +1,44 @@
+# Environment / secrets
+.env
+*.env
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ML / model artifacts
+*.pt
+*.pth
+*.ckpt
+checkpoints/
+
+# Spark
+spark-warehouse/
+metastore_db/
+*.log
+*.crc
+_SUCCESS
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Docker
+docker-compose.override.yml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
