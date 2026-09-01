@@ -2,9 +2,9 @@
 per-account state (recent transaction timestamps, last location, running amount/velocity
 averages), and flags transactions that trip one or more rules:
 
-  - velocity:  the account's live 5-minute sliding transaction count exceeds
-               VELOCITY_SPIKE_MULTIPLIER x that account's own historical baseline — the
-               average count seen in its past *completed* 5-minute tumbling windows only.
+  - velocity:  the account's live 5-minute sliding transaction count is more than two
+               standard deviations above its own historical baseline — the count seen in
+               its past *completed* 5-minute tumbling windows only.
                The baseline deliberately excludes the in-progress window: folding a burst's
                own events into its own baseline as they happen would let the anomaly chase
                (and dilute) the very average it's being compared against.
@@ -27,11 +27,8 @@ Run inside the spark container:
 """
 
 import json
-import math
 import os
-import sys
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # /opt/spark-apps, for `storage.db_writer`
+import time
 
 import pandas as pd
 from pyspark.sql import SparkSession
@@ -48,37 +45,25 @@ from pyspark.sql.types import (
     TimestampType,
 )
 
-from storage import db_writer
+from src.detection.rules import amount_signal, geo_signal, velocity_signal
+from src.storage import db_writer
+from src.streaming.watchdog import ProgressWatchdog, StreamStalledError
 
 KAFKA_BROKER = os.getenv("KAFKA_BROKER_INTERNAL", "kafka:9092")
 KAFKA_TOPIC = "transactions"
-CHECKPOINT_LOCATION = "/opt/spark-apps/streaming/checkpoints/fraud_detector"
+DETECTOR_VERSION = "v2"
+CHECKPOINT_LOCATION = os.getenv(
+    "CHECKPOINT_LOCATION", "/opt/fraud-pipeline/checkpoints/fraud_detector_v2_2"
+)
+STREAM_STALL_TIMEOUT_SECONDS = float(os.getenv("STREAM_STALL_TIMEOUT_SECONDS", "180"))
+STREAM_RESTART_LIMIT = int(os.getenv("STREAM_RESTART_LIMIT", "5"))
+STREAM_RESTART_BACKOFF_SECONDS = float(os.getenv("STREAM_RESTART_BACKOFF_SECONDS", "10"))
+MAX_OFFSETS_PER_TRIGGER = int(os.getenv("MAX_OFFSETS_PER_TRIGGER", "1000"))
+STREAM_TRIGGER_SECONDS = float(os.getenv("STREAM_TRIGGER_SECONDS", "5"))
 
 VELOCITY_WINDOW_MS = 5 * 60 * 1000
-# Each observation here is one *completed* 5-minute window, not one transaction — a
-# freshly-deployed detector (or a short local demo run) may only accumulate a handful of
-# completed windows per account, so this gate has to be low enough to actually open in that
-# time. A long-running production deployment would naturally build a deeper baseline.
-VELOCITY_MIN_OBSERVATIONS = 1
-# Empirically swept against a 20-min/10k-event soak run: at this account pool size and
-# burst size (4-8 events), the velocity signal is only modestly separable from an account's
-# own baseline (bursts average ~1.5x baseline vs ~1.05x for normal windows) — no threshold
-# achieves both good precision and good recall here. 1.6 is near the best precision/recall
-# balance point found (~26%/~28%); this is a real property of the injected signal size
-# relative to typical per-account window activity, not a rule-logic bug.
-VELOCITY_SPIKE_MULTIPLIER = 1.6
-AMOUNT_MIN_OBSERVATIONS = 3
-AMOUNT_SPIKE_MULTIPLIER = 5.0
-IMPOSSIBLE_SPEED_KMH = 900.0
-
-# Rough centroid (lat, lon) per country code used by the producer — good enough to tell
-# "clearly impossible" travel apart from "plausible", not a real geolocation source.
-COUNTRY_CENTROIDS = {
-    "US": (39.8, -98.6), "GB": (54.0, -2.0), "DE": (51.2, 10.4), "FR": (46.6, 2.2),
-    "JP": (36.2, 138.3), "AU": (-25.3, 133.8), "BR": (-14.2, -51.9), "IN": (20.6, 79.0),
-    "CA": (56.1, -106.3), "SG": (1.35, 103.8), "NL": (52.1, 5.3), "MX": (23.6, -102.5),
-    "ZA": (-30.6, 22.9), "AE": (23.4, 53.8), "KR": (35.9, 127.8),
-}
+# Rule thresholds live in src.detection.rules so the Spark adapter and unit tests share
+# one source of truth.
 
 INPUT_SCHEMA = StructType([
     StructField("transaction_id", StringType()),
@@ -88,10 +73,13 @@ INPUT_SCHEMA = StructType([
     StructField("location", StringType()),
     StructField("timestamp", StringType()),
     StructField("injected_label", StringType()),
+    StructField("evaluation_run_id", StringType()),
 ])
 
 OUTPUT_SCHEMA = StructType([
     StructField("transaction_id", StringType()),
+    StructField("detector_version", StringType()),
+    StructField("evaluation_run_id", StringType()),
     StructField("account_id", StringType()),
     StructField("amount", DoubleType()),
     StructField("merchant", StringType()),
@@ -105,6 +93,7 @@ OUTPUT_SCHEMA = StructType([
     StructField("triggered_rules", StringType()),
     StructField("velocity_count_5min", IntegerType()),
     StructField("velocity_ratio_to_baseline", DoubleType()),
+    StructField("velocity_z_score", DoubleType()),
     StructField("amount_ratio_to_avg", DoubleType()),
     StructField("implied_speed_kmh", DoubleType()),
 ])
@@ -119,34 +108,23 @@ STATE_SCHEMA = StructType([
     StructField("velocity_window_count", LongType()),
     StructField("velocity_baseline_count", LongType()),
     StructField("velocity_baseline_mean", DoubleType()),
+    StructField("velocity_baseline_m2", DoubleType()),
 ])
-
-
-def haversine_km(country_a: str, country_b: str) -> float:
-    if country_a not in COUNTRY_CENTROIDS or country_b not in COUNTRY_CENTROIDS:
-        return 0.0
-    lat1, lon1 = COUNTRY_CENTROIDS[country_a]
-    lat2, lon2 = COUNTRY_CENTROIDS[country_b]
-    r_km = 6371.0
-    p1, p2 = math.radians(lat1), math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dlambda = math.radians(lon2 - lon1)
-    a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlambda / 2) ** 2
-    return 2 * r_km * math.asin(math.sqrt(a))
 
 
 def update_account_state(key, pdf_iter, state: GroupState):
     if state.exists:
         (last_location, last_event_time_ms, amount_count, amount_mean, recent_ts_json,
          velocity_window_start_ms, velocity_window_count,
-         velocity_baseline_count, velocity_baseline_mean) = state.get
+         velocity_baseline_count, velocity_baseline_mean,
+         velocity_baseline_m2) = state.get
         recent_timestamps = json.loads(recent_ts_json) if recent_ts_json else []
     else:
         last_location, last_event_time_ms = None, None
         amount_count, amount_mean = 0, 0.0
         recent_timestamps = []
         velocity_window_start_ms, velocity_window_count = None, 0
-        velocity_baseline_count, velocity_baseline_mean = 0, 0.0
+        velocity_baseline_count, velocity_baseline_mean, velocity_baseline_m2 = 0, 0.0, 0.0
 
     out_rows = []
     for pdf in pdf_iter:
@@ -163,27 +141,24 @@ def update_account_state(key, pdf_iter, state: GroupState):
                 velocity_window_start_ms = event_time_ms
             elif event_time_ms - velocity_window_start_ms >= VELOCITY_WINDOW_MS:
                 new_baseline_count = velocity_baseline_count + 1
-                velocity_baseline_mean += (velocity_window_count - velocity_baseline_mean) / new_baseline_count
+                delta = velocity_window_count - velocity_baseline_mean
+                velocity_baseline_mean += delta / new_baseline_count
+                delta_after_update = velocity_window_count - velocity_baseline_mean
+                velocity_baseline_m2 += delta * delta_after_update
                 velocity_baseline_count = new_baseline_count
                 velocity_window_start_ms = event_time_ms
                 velocity_window_count = 0
 
-            velocity_ratio = (velocity_count / velocity_baseline_mean) if velocity_baseline_mean > 0 else 0.0
-            flag_velocity = (
-                velocity_baseline_count >= VELOCITY_MIN_OBSERVATIONS
-                and velocity_count > velocity_baseline_mean * VELOCITY_SPIKE_MULTIPLIER
+            flag_velocity, velocity_ratio, velocity_z_score = velocity_signal(
+                velocity_count,
+                velocity_baseline_count,
+                velocity_baseline_mean,
+                velocity_baseline_m2,
             )
 
-            implied_speed_kmh = 0.0
-            flag_geo = False
-            if last_location is not None and row.location != last_location:
-                distance_km = haversine_km(last_location, row.location)
-                hours_elapsed = max((event_time_ms - last_event_time_ms) / 3_600_000.0, 1e-6)
-                implied_speed_kmh = distance_km / hours_elapsed
-                flag_geo = implied_speed_kmh > IMPOSSIBLE_SPEED_KMH
-
-            amount_ratio = (row.amount / amount_mean) if amount_mean > 0 else 0.0
-            flag_amount = amount_count >= AMOUNT_MIN_OBSERVATIONS and row.amount > amount_mean * AMOUNT_SPIKE_MULTIPLIER
+            elapsed_ms = event_time_ms - last_event_time_ms if last_event_time_ms else None
+            flag_geo, implied_speed_kmh = geo_signal(last_location, row.location, elapsed_ms)
+            flag_amount, amount_ratio = amount_signal(row.amount, amount_count, amount_mean)
 
             triggered = [
                 name for name, fired in (
@@ -195,6 +170,8 @@ def update_account_state(key, pdf_iter, state: GroupState):
 
             out_rows.append({
                 "transaction_id": row.transaction_id,
+                "detector_version": DETECTOR_VERSION,
+                "evaluation_run_id": row.evaluation_run_id,
                 "account_id": row.account_id,
                 "amount": row.amount,
                 "merchant": row.merchant,
@@ -207,9 +184,12 @@ def update_account_state(key, pdf_iter, state: GroupState):
                 "is_flagged": len(triggered) > 0,
                 "triggered_rules": ",".join(triggered),
                 "velocity_count_5min": velocity_count,
-                "velocity_ratio_to_baseline": round(velocity_ratio, 3),
-                "amount_ratio_to_avg": round(amount_ratio, 3),
-                "implied_speed_kmh": round(implied_speed_kmh, 1),
+                # Persist full precision so offline threshold sweeps reproduce the
+                # detector's strict boundaries exactly; presentation layers format it.
+                "velocity_ratio_to_baseline": velocity_ratio,
+                "velocity_z_score": velocity_z_score,
+                "amount_ratio_to_avg": amount_ratio,
+                "implied_speed_kmh": implied_speed_kmh,
             })
 
             recent_timestamps.append(event_time_ms)
@@ -223,7 +203,7 @@ def update_account_state(key, pdf_iter, state: GroupState):
     state.update((
         last_location, last_event_time_ms, amount_count, amount_mean, json.dumps(recent_timestamps),
         velocity_window_start_ms, velocity_window_count,
-        velocity_baseline_count, velocity_baseline_mean,
+        velocity_baseline_count, velocity_baseline_mean, velocity_baseline_m2,
     ))
 
     columns = [f.name for f in OUTPUT_SCHEMA.fields]
@@ -243,16 +223,13 @@ def build_spark() -> SparkSession:
     )
 
 
-def main() -> None:
-    spark = build_spark()
-    spark.sparkContext.setLogLevel("WARN")
-
+def start_query(spark: SparkSession):
     raw = (
         spark.readStream.format("kafka")
         .option("kafka.bootstrap.servers", KAFKA_BROKER)
         .option("subscribe", KAFKA_TOPIC)
         .option("startingOffsets", "latest")
-        .option("maxOffsetsPerTrigger", "200")
+        .option("maxOffsetsPerTrigger", str(MAX_OFFSETS_PER_TRIGGER))
         .load()
     )
 
@@ -271,26 +248,61 @@ def main() -> None:
         GroupStateTimeout.NoTimeout,
     )
 
-    jdbc_url, jdbc_props = db_writer.jdbc_config()
+    postgres_url = db_writer.get_postgres_url()
+    jdbc_url, jdbc_props = db_writer.jdbc_config(postgres_url)
+    db_writer.ensure_schema(postgres_url)
 
     def write_batch(batch_df, batch_id):
         batch_df.persist()
         try:
             if not batch_df.isEmpty():
-                db_writer.write_processed_batch(batch_df, jdbc_url, jdbc_props)
-                db_writer.write_flagged_batch(batch_df, jdbc_url, jdbc_props)
+                db_writer.write_batch_idempotent(
+                    batch_df,
+                    batch_id=batch_id,
+                    postgres_url=postgres_url,
+                    jdbc_url=jdbc_url,
+                    jdbc_props=jdbc_props,
+                )
         finally:
             batch_df.unpersist()
 
-    query = (
+    return (
         flagged_and_processed.writeStream
         .outputMode("update")
         .foreachBatch(write_batch)
         .option("checkpointLocation", CHECKPOINT_LOCATION)
+        .trigger(processingTime=f"{STREAM_TRIGGER_SECONDS:g} seconds")
         .start()
     )
 
-    query.awaitTermination()
+
+def await_with_watchdog(query) -> None:
+    watchdog = ProgressWatchdog(timeout_seconds=STREAM_STALL_TIMEOUT_SECONDS)
+    while query.isActive:
+        progress = query.lastProgress
+        token = progress.get("timestamp") if progress else None
+        if watchdog.observe(token, time.monotonic()):
+            query.stop()
+            raise StreamStalledError(
+                f"No Spark progress heartbeat for {STREAM_STALL_TIMEOUT_SECONDS:.0f} seconds"
+            )
+        query.awaitTermination(10)
+
+
+def main() -> None:
+    spark = build_spark()
+    spark.sparkContext.setLogLevel("WARN")
+    for attempt in range(STREAM_RESTART_LIMIT + 1):
+        query = start_query(spark)
+        try:
+            await_with_watchdog(query)
+            return
+        except StreamStalledError:
+            if attempt >= STREAM_RESTART_LIMIT:
+                raise
+            wait = STREAM_RESTART_BACKOFF_SECONDS * (attempt + 1)
+            print(f"Stream stalled; restarting from checkpoint in {wait:.0f}s", flush=True)
+            time.sleep(wait)
 
 
 if __name__ == "__main__":

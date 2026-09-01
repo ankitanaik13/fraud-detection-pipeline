@@ -1,5 +1,7 @@
 # Real-Time Transaction Fraud Detection Pipeline
 
+[![CI](https://github.com/ankitanaik13/fraud-detection-pipeline/actions/workflows/ci.yml/badge.svg)](https://github.com/ankitanaik13/fraud-detection-pipeline/actions/workflows/ci.yml)
+
 A local, four-stage pipeline that simulates a live transaction stream, flags anomalies with
 per-account stateful rules in Spark, explains each flag in plain English via an LLM, and
 exposes account risk status as an MCP tool. Runs entirely on Docker Compose — no GPU, no
@@ -7,9 +9,9 @@ notebooks, no cloud dependency except the LLM call itself.
 
 Built as a portfolio project to demonstrate the full loop: synthetic ground truth →
 streaming detection → measured precision/recall → tuning against real numbers → LLM
-enrichment → a queryable tool interface. The results below are real, including the ones
-that aren't flattering (velocity's recall is bad, and here's the swept threshold data
-proving why).
+enrichment → a queryable tool interface. Detector versions and evaluation-run IDs are
+persisted with every prediction, so benchmark reports cannot silently mix algorithms,
+cold-start traffic, or earlier experiments.
 
 ## Architecture
 
@@ -45,18 +47,18 @@ computed after the fact.
 ## Quickstart
 
 ```bash
-docker compose up -d kafka postgres spark
-python src/producer/generate_transactions.py --rate 8
-
-# in another shell
-docker compose exec spark spark-submit \
-  --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.9,org.postgresql:postgresql:42.7.3 \
-  /opt/spark-apps/streaming/fraud_detector.py
+cp .env.example .env
+docker compose up -d --build
+python -m src.producer.generate_transactions --rate 8
 
 # once some transactions are flagged
-python src/explain/llm_explainer.py --limit 50
-python src/mcp/risk_status_server.py   # stdio transport
+python -m src.explain.llm_explainer --limit 50
+python -m src.mcp.risk_status_server   # stdio transport
 ```
+
+Compose waits for Kafka and Postgres health checks, then starts the Spark job
+automatically. The checkpoint is stored in a named volume, so a container restart resumes
+from committed offsets instead of replaying the topic from scratch.
 
 `generate_transactions.py --injection-mode {random,borderline,straddle}` controls how
 `impossible_travel` anomalies are constructed — see "The geo finding" below for why this
@@ -70,13 +72,36 @@ Per-account rolling state, maintained via `applyInPandasWithState`:
 |---|---|---|
 | **amount** | amount > 5x the account's running historical average | ≥3 prior transactions |
 | **geo** | implied travel speed between consecutive transaction locations > 900 km/h | a previous transaction to compare against |
-| **velocity** | live 5-minute transaction count > 1.6x the account's average count across its own past *completed* 5-minute windows | ≥1 completed window |
+| **velocity** | live 5-minute count >2 standard deviations above the account's completed-window baseline, plus a 1.2x ratio guard | ≥5 completed windows |
 
-Velocity's baseline deliberately excludes the in-progress window — folding a burst's own
-events into its own baseline as they happen would let the anomaly dilute the very average
-it's being compared against. (This was a real bug caught mid-development; see below.)
+Velocity v2 maintains mean and variance online with Welford's algorithm. Its effective
+standard deviation is conservatively floored at the Poisson expectation `sqrt(mean)`, so
+a few identical low-count windows cannot create an unstable or infinite z-score. The
+baseline excludes the in-progress window—otherwise a burst would dilute its own signal.
 
-## Results (20-minute soak run, 500 simulated accounts, 10,028 events)
+## Current v2 release result
+
+The quality-gated run `v2-release-20260901` processed 3,427 events: five normal history
+windows for each of 500 run-isolated accounts, followed by a 75-second straddle benchmark.
+The gate required at least 20 positive examples per rule and at least 0.50 precision and
+recall; all three rules passed.
+
+| Rule | Positive examples | Precision | Recall | F1 | Precision 95% CI |
+|---|---:|---:|---:|---:|---:|
+| amount | 63 | 100.0% | 98.4% | 99.2% | 94.2–100% |
+| geo | 33 | 100.0% | 100.0% | 100.0% | 89.6–100% |
+| velocity | 419 | 89.9% | 61.6% | 73.1% | 85.9–92.9% |
+| overall | 515 | 92.9% | 68.5% | 78.9% | 89.9–95.1% |
+
+The report includes confusion matrices, Wilson intervals, the exact rule configuration,
+and a velocity threshold sweep. See [`outputs/v2_release_metrics.json`](outputs/v2_release_metrics.json).
+Risk scoring uses each rule's **95% precision lower bound**, not the point estimate.
+
+## Historical v1 benchmark (20-minute soak, 500 accounts, 10,028 events)
+
+These figures describe the retired ratio-to-mean velocity detector (`v1`), not the current
+variance-aware detector. They are retained as an engineering audit trail and as the reason
+v2 was built; they must not be presented as v2 performance.
 
 | Rule | Precision | Recall |
 |---|---|---|
@@ -85,7 +110,7 @@ it's being compared against. (This was a real bug caught mid-development; see be
 | velocity | 26% | 28% |
 | overall (any rule) | 38% | 43% |
 
-### The velocity finding
+### Why velocity v1 was replaced
 
 Recall is high across the board (77-94%) except velocity. This isn't a tuning miss — it's
 swept:
@@ -100,14 +125,13 @@ swept:
 | 2.5 | 20% | 5% |
 | 3.0 | 15% | 2% |
 
-No threshold gets both good precision and good recall — precision tops out around 26-28%
+No v1 ratio threshold gets both good precision and good recall—precision tops out around 26-28%
 no matter where the line is drawn. **Root cause:** a 4-8 event injected burst only pushes an
 account's 5-minute window count to ~1.5x its own baseline on average (max observed 5x);
 normal (non-burst) windows already sit at ~1.0-1.1x baseline just from ordinary variance.
 The signal and the noise floor are too close together for a ratio-to-mean test to separate
-them cleanly. Two ways to actually fix it: inject larger bursts (more separation from
-baseline), or replace the fixed-multiplier test with a variance-aware statistical test
-(z-score against the window-count distribution, not just its mean).
+them cleanly. v2 implements the variance-aware statistical test identified by that audit.
+Its performance is published only after the versioned quality gate has sufficient samples.
 
 ### The geo finding: is 94% recall real, or trivial?
 
@@ -137,8 +161,8 @@ Two follow-up injection modes make this testable:
   **100% precision, 100% recall, zero errors either direction**, across an achieved-speed
   range of 699.6-1,091.2 km/h. The rule's boundary behavior is exact, not fuzzy — as
   expected for a hard `>900` threshold, but worth confirming empirically since it also
-  validates the producer's back-calculation and the detector's haversine math (duplicated
-  across two files) agree with each other precisely.
+  validates the producer's back-calculation and the detector's canonical shared haversine
+  implementation agree with each other precisely.
 
   Scoring this same run against `injected_label` alone (the usual methodology) gives a
   misleading TP=60/FP=131/FN=80 — "43% recall." That's a scoring-convention artifact, not a
@@ -159,9 +183,13 @@ strongly (and flagged as often-a-false-positive) for velocity. Writes back to
 `flagged_transactions.explanation`; safe to re-run, only unexplained rows are processed.
 
 ```bash
-python src/explain/llm_explainer.py --limit 50
-python src/explain/llm_explainer.py --transaction-ids id1,id2   # re-explain specific rows
+python -m src.explain.llm_explainer --limit 50
+python -m src.explain.llm_explainer --transaction-ids id1,id2
 ```
+
+Untrusted transaction fields are bounded and isolated inside explicit prompt-data tags.
+Generated text is accepted only when it is a single, non-Markdown sentence under 600
+characters; invalid generations are retried rather than written to the database.
 
 **Two real bugs surfaced during testing:**
 
@@ -181,20 +209,86 @@ python src/explain/llm_explainer.py --transaction-ids id1,id2   # re-explain spe
 Exposes one tool, `get_account_risk_status(account_id)`, over stdio via the official MCP
 Python SDK. Queries Postgres for that account's flagged-transaction history and returns:
 
-- `risk_score` — sum of each triggered rule's precision across all of the account's flags
-  (an amount flag contributes ~1.00, a geo flag ~0.50, a velocity flag ~0.26), so the score
-  reflects trustworthy signal, not just flag count — an account with nine velocity flags and
-  one amount flag scores lower than one with two amount flags
+- `risk_score` — sum of conservative v2 precision lower bounds across the account's v2
+  flags (amount 0.9417, geo 0.8957, velocity 0.8586); the response explicitly returns
+  `scoring_calibration: "v2-release-20260901-precision-ci95-lower"`
 - `risk_level` — `none` / `low` / `medium` / `high`, thresholded on `risk_score`
 - `flags_by_rule`, `total_flags`, `total_processed_transactions`
 - `recent_flags` — up to the last 20 flagged transactions, each with its triggered rule(s),
   injected label (ground truth, for dev/testing), and LLM explanation where generated
 
 ```bash
-python src/mcp/risk_status_server.py   # stdio transport
+python -m src.mcp.risk_status_server   # stdio transport
 ```
 
-### Sample output
+The MCP boundary validates account IDs before querying Postgres, and all queries remain
+parameterized.
+
+## Delivery semantics and stall recovery
+
+- **Idempotent sink:** each micro-batch is written to a staging table and merged into
+  Postgres on the stable `transaction_id` primary key. If Spark retries after a database
+  commit but before checkpoint advancement, the replay cannot duplicate transactions.
+- **Durable checkpoint:** Kafka offsets and state-store progress live in a named Docker
+  volume.
+- **Progress watchdog:** a ten-second processing trigger creates a regular progress
+  heartbeat. If no new heartbeat appears for `STREAM_STALL_TIMEOUT_SECONDS`, the query is
+  stopped and restarted from its checkpoint with bounded backoff.
+- **Schema ownership:** the sink creates explicit tables, primary keys, constraints, and
+  account/time indexes rather than relying on Spark's inferred schema.
+
+The watchdog turns the previously silent Kafka/Spark stall into an observable and
+recoverable event. It mitigates the connector behavior; it does not claim to fix the
+upstream connector itself.
+
+## Reproducible evaluation
+
+The checked-in evaluator derives rule-level and overall confusion matrices, precision,
+recall, F1, and Wilson 95% confidence intervals directly from
+`processed_transactions`. First run a benchmark with normal history preloaded for each
+account; otherwise a short test measures cold-start behavior rather than steady state:
+
+```bash
+RUN_ID="v2-straddle-$(date -u +%Y%m%dT%H%M%SZ)"
+python -m src.producer.generate_transactions \
+  --rate 8 --accounts 500 --anomaly-rate 0.12 --duration 180 \
+  --warmup-windows 5 --injection-mode straddle --run-id "$RUN_ID"
+
+# after Spark consumes the run
+python -m src.evaluation.evaluate_database \
+  --detector-version v2 --run-id "$RUN_ID" --fail-on-quality-gate
+```
+
+It scores geo straddle cases against achieved speed, not merely the injected label, so
+deliberately below-threshold examples are not misreported as false negatives—either at
+the geo-rule level or in overall metrics. The default release gate requires at least 20
+positive examples per rule and at least 0.50 precision and recall. Reports include their
+detector version, run ID, generation time, sample counts, metrics, intervals, and explicit
+gate failures; the default output is `outputs/latest_metrics.json`.
+
+The producer derives an account-ID namespace from each run ID, preventing Spark state from
+one experiment contaminating another. Travel injections also update the simulated account's
+current location, so the next normal event is not an unlabeled impossible return trip.
+
+## Engineering checks
+
+```bash
+pip install -r requirements-dev.txt
+make check
+docker compose config --quiet
+```
+
+The unit suite covers strict rule boundaries, variance-aware velocity behavior, zero
+baselines, shared geospatial math, precision-weighted risk scoring, straddle and overall
+evaluation semantics, confidence intervals, quality gates, watchdog behavior,
+idempotent sink construction, URL validation, and LLM output guards. GitHub Actions runs
+linting, 85% coverage enforcement, Compose validation, and the Spark image build.
+
+### Historical v1 sample output
+
+This payload is retained only to show the MCP response shape from the earlier soak run;
+its score and explanation wording use the retired v1 calibration. Current v2 responses
+also include `detector_version` and `scoring_calibration` and use the release weights above.
 
 `get_account_risk_status("acct_00434")` — an account with all three rule types represented:
 
@@ -244,27 +338,21 @@ python src/mcp/risk_status_server.py   # stdio transport
 }
 ```
 
-Notice the risk score arithmetic: 9 velocity flags contribute only ~2.34 (9 × 0.26) while
-the single amount flag contributes 1.00 — volume of low-precision flags doesn't dominate the
-score the way a naive count would.
+The historical arithmetic shown in this payload must not be used for v2; current weights
+are versioned and derived from conservative bounds in the checked-in release report.
 
 Verified over the real MCP stdio protocol (tool registration → `initialize` → `call_tool`),
 not just a direct function call, via a scratch MCP client.
 
 ## Known limitations
 
-- **The Spark↔Kafka connector intermittently stalls mid-stream** in this local setup — the
-  stream-execution thread keeps looping but stops issuing new micro-batches, with zero new
-  Spark jobs launched. Applying `spark.sql.streaming.kafka.useDeprecatedOffsetFetching=true`
-  helped but didn't eliminate it. **Workaround used throughout development:** batch-replay
-  the full topic (`startingOffsets=earliest`) rather than babysitting a long-running live
-  query — this consistently completes in seconds without stalling, at the cost of not being
-  a truly continuous live deployment. Not yet root-caused; a real continuous deployment
-  would need this fixed or a supervisor that restarts the job on stall.
-- **`src/mcp/` shares its name with the installed `mcp` package.** Running
-  `risk_status_server.py` directly (as shown above) is unaffected, but avoid adding `src/`
-  itself to `sys.path` in code that also needs to `import mcp` (the third-party SDK) — the
-  local package would shadow it.
+- **The Spark↔Kafka connector has intermittently stalled in the local Docker setup.** The
+  progress watchdog now detects and restarts it from a durable checkpoint, but the
+  underlying connector behavior is not root-caused. A managed deployment should alert on
+  restart count and Kafka consumer lag.
+- **`src/mcp/` shares its name with the installed `mcp` package.** Always launch it as a
+  module from the repository root (`python -m src.mcp.risk_status_server`) so the local
+  package does not shadow the SDK.
 - **`generate_transactions.py` account identities are deterministic** (seeded by account
   index), not re-randomized per process start. An earlier version re-randomized on every
   run, which silently reassigned a given account's home country between producer

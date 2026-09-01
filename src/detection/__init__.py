@@ -1,0 +1,1 @@
+"""Pure detection-domain logic."""

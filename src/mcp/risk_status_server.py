@@ -2,38 +2,34 @@
 account's flagged-transaction history and returns a risk score, a per-rule breakdown, and
 the recent flagged transactions (with LLM explanation where available).
 
-The risk score weights each triggered rule by its measured precision (see README) rather
-than counting flags equally — an amount flag (~100% precision) should move the needle far
-more than a velocity flag (~26% precision, more often noise than signal).
+The risk score uses Wilson 95% lower precision bounds from the quality-gated v2 release
+evaluation (see README), rather than optimistic point estimates or equal flag counts. The
+response names the exact calibration version.
 
 Run: python src/mcp/risk_status_server.py  (stdio transport)
 """
 
 import os
+import re
 
 import psycopg2
 import psycopg2.extras
 from dotenv import load_dotenv
 from mcp.server import MCPServer
 
+from src.common.scoring import (
+    SCORING_CALIBRATION_VERSION,
+    risk_level,
+    score_triggered_rules,
+)
+
 load_dotenv()
 
 DEFAULT_POSTGRES_URL = "postgresql://fraud:fraud@localhost:5432/frauddb"
 RECENT_FLAGS_LIMIT = 20
+DETECTOR_VERSION = os.getenv("DETECTOR_VERSION", "v2")
 
-# Same precision figures used by src/explain/llm_explainer.py, measured against the
-# 20-min/10k-event soak run documented in README.md.
-RULE_PRECISION = {
-    "amount": 1.00,
-    "geo": 0.50,
-    "velocity": 0.26,
-}
-
-RISK_LEVEL_THRESHOLDS = (
-    (3.0, "high"),
-    (1.0, "medium"),
-    (0.0, "low"),
-)
+ACCOUNT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 server = MCPServer("risk-status")
 
@@ -42,19 +38,13 @@ def get_postgres_url() -> str:
     return os.getenv("POSTGRES_URL") or DEFAULT_POSTGRES_URL
 
 
-def risk_level(score: float) -> str:
-    if score <= 0:
-        return "none"
-    for threshold, label in RISK_LEVEL_THRESHOLDS:
-        if score >= threshold:
-            return label
-    return "low"
-
-
 @server.tool()
 def get_account_risk_status(account_id: str) -> dict:
     """Return current risk status for an account: risk score, per-rule flag breakdown, and
     recent flagged transactions with their triggered rule(s) and LLM explanation."""
+    if not ACCOUNT_ID_RE.fullmatch(account_id):
+        raise ValueError("account_id must contain 1-64 letters, digits, underscores, or hyphens")
+
     conn = psycopg2.connect(get_postgres_url())
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -63,34 +53,33 @@ def get_account_risk_status(account_id: str) -> dict:
                 SELECT transaction_id, account_id, amount, merchant, location, event_timestamp,
                        injected_label, triggered_rules, explanation
                 FROM flagged_transactions
-                WHERE account_id = %s
+                WHERE account_id = %s AND detector_version = %s
                 ORDER BY event_timestamp DESC
                 LIMIT %s
                 """,
-                (account_id, RECENT_FLAGS_LIMIT),
+                (account_id, DETECTOR_VERSION, RECENT_FLAGS_LIMIT),
             )
             recent = cur.fetchall()
 
             cur.execute(
-                "SELECT triggered_rules FROM flagged_transactions WHERE account_id = %s",
-                (account_id,),
+                """SELECT triggered_rules FROM flagged_transactions
+                   WHERE account_id = %s AND detector_version = %s""",
+                (account_id, DETECTOR_VERSION),
             )
             all_triggered = cur.fetchall()
 
             cur.execute(
-                "SELECT count(*) AS n FROM processed_transactions WHERE account_id = %s",
-                (account_id,),
+                """SELECT count(*) AS n FROM processed_transactions
+                   WHERE account_id = %s AND detector_version = %s""",
+                (account_id, DETECTOR_VERSION),
             )
             total_processed = cur.fetchone()["n"]
     finally:
         conn.close()
 
-    flags_by_rule = {rule: 0 for rule in RULE_PRECISION}
-    risk_score = 0.0
-    for row in all_triggered:
-        for rule in row["triggered_rules"].split(","):
-            flags_by_rule[rule] = flags_by_rule.get(rule, 0) + 1
-            risk_score += RULE_PRECISION.get(rule, 0.0)
+    risk_score, flags_by_rule = score_triggered_rules(
+        [row["triggered_rules"] for row in all_triggered]
+    )
 
     recent_flags = [
         {
@@ -108,7 +97,9 @@ def get_account_risk_status(account_id: str) -> dict:
 
     return {
         "account_id": account_id,
-        "risk_score": round(risk_score, 2),
+        "detector_version": DETECTOR_VERSION,
+        "scoring_calibration": SCORING_CALIBRATION_VERSION,
+        "risk_score": risk_score,
         "risk_level": risk_level(risk_score),
         "total_flags": len(all_triggered),
         "total_processed_transactions": total_processed,

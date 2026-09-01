@@ -27,8 +27,8 @@ All modes use the same haversine distance math src/streaming/fraud_detector.py u
 """
 
 import argparse
+import hashlib
 import json
-import math
 import os
 import random
 import time
@@ -41,12 +41,14 @@ from dotenv import load_dotenv
 from kafka import KafkaProducer
 from kafka.errors import NoBrokersAvailable
 
+from src.common.geo import COUNTRY_CENTROIDS, haversine_km
+
 load_dotenv()
 
 DEFAULT_TOPIC = "transactions"
 DEFAULT_BROKER = os.getenv("KAFKA_BROKER") or "localhost:29092"
 
-COUNTRIES = ["US", "GB", "DE", "FR", "JP", "AU", "BR", "IN", "CA", "SG", "NL", "MX", "ZA", "AE", "KR"]
+COUNTRIES = list(COUNTRY_CENTROIDS)
 MERCHANTS = [
     "Amazon", "Walmart", "Target", "Uber", "Starbucks", "Whole Foods", "Shell Gas",
     "Netflix", "Best Buy", "Delta Air Lines", "Marriott", "Apple Store", "Steam",
@@ -55,16 +57,6 @@ MERCHANTS = [
 
 ANOMALY_TYPES = ["impossible_travel", "amount_spike", "velocity_burst"]
 
-# Same country centroids + haversine formula as src/streaming/fraud_detector.py's
-# COUNTRY_CENTROIDS / haversine_km — duplicated rather than imported since this module runs
-# on the host and that one runs in the Spark container. Keep them in sync by hand.
-COUNTRY_CENTROIDS = {
-    "US": (39.8, -98.6), "GB": (54.0, -2.0), "DE": (51.2, 10.4), "FR": (46.6, 2.2),
-    "JP": (36.2, 138.3), "AU": (-25.3, 133.8), "BR": (-14.2, -51.9), "IN": (20.6, 79.0),
-    "CA": (56.1, -106.3), "SG": (1.35, 103.8), "NL": (52.1, 5.3), "MX": (23.6, -102.5),
-    "ZA": (-30.6, 22.9), "AE": (23.4, 53.8), "KR": (35.9, 127.8),
-}
-
 BORDERLINE_SPEED_MIN_KMH = 1000.0
 BORDERLINE_SPEED_MAX_KMH = 3000.0
 
@@ -72,17 +64,6 @@ BORDERLINE_SPEED_MAX_KMH = 3000.0
 # stays safely above it.
 STRADDLE_SPEED_MIN_KMH = 700.0
 STRADDLE_SPEED_MAX_KMH = 1100.0
-
-
-def haversine_km(country_a: str, country_b: str) -> float:
-    lat1, lon1 = COUNTRY_CENTROIDS[country_a]
-    lat2, lon2 = COUNTRY_CENTROIDS[country_b]
-    r_km = 6371.0
-    p1, p2 = math.radians(lat1), math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dlambda = math.radians(lon2 - lon1)
-    a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlambda / 2) ** 2
-    return 2 * r_km * math.asin(math.sqrt(a))
 
 
 @dataclass
@@ -94,17 +75,18 @@ class Account:
     last_timestamp: Optional[datetime] = None
 
 
-def build_accounts(n: int) -> list[Account]:
+def build_accounts(n: int, namespace: str | None = None) -> list[Account]:
     # Seeded per account index (not the shared `random` module state) so the same
     # account_id gets the same home_country/historical_avg every time the producer runs —
     # otherwise restarting the producer reshuffles identities out from under any account
     # that survived from a prior run, and re-randomized home_country reads as impossible
     # travel to a detector that (correctly) doesn't know the identity changed underneath it.
     accounts = []
+    prefix = f"r_{namespace}_" if namespace else ""
     for i in range(n):
         rng = random.Random(i)
         accounts.append(Account(
-            account_id=f"acct_{i:05d}",
+            account_id=f"{prefix}acct_{i:05d}",
             home_country=rng.choice(COUNTRIES),
             historical_avg=round(rng.uniform(30.0, 300.0), 2),
         ))
@@ -189,6 +171,10 @@ def velocity_burst_events(account: Account) -> list[dict]:
 def touch_account(account: Account, event: dict) -> None:
     account.last_location = event["location"]
     account.last_timestamp = datetime.fromisoformat(event["timestamp"])
+    if event.get("injected_label") == "impossible_travel":
+        # The account remains at the injected destination. Snapping the next normal
+        # event back to its original home would create an unlabeled impossible return.
+        account.home_country = event["location"]
 
 
 def build_producer(broker: str) -> KafkaProducer:
@@ -205,8 +191,11 @@ def build_producer(broker: str) -> KafkaProducer:
 def run(
     rate: float, broker: str, topic: str, num_accounts: int, anomaly_rate: float,
     duration: Optional[float], injection_mode: str = "random",
+    warmup_windows: int = 0, run_id: str | None = None,
 ) -> None:
-    accounts = build_accounts(num_accounts)
+    run_id = run_id or f"eval-{uuid.uuid4()}"
+    namespace = hashlib.sha256(run_id.encode()).hexdigest()[:10]
+    accounts = build_accounts(num_accounts, namespace=namespace)
 
     try:
         producer = build_producer(broker)
@@ -219,6 +208,33 @@ def run(
     start = time.monotonic()
     sent = 0
     anomaly_counts = {t: 0 for t in ANOMALY_TYPES}
+
+    print(f"Evaluation run ID: {run_id}")
+    if warmup_windows:
+        # Seed completed, normal 5-minute windows before injecting anomalies. Without this,
+        # short benchmarks measure detector cold start rather than steady-state quality.
+        warmup_start = datetime.now(timezone.utc) - timedelta(
+            minutes=5 * warmup_windows + 1
+        )
+        print(
+            f"Publishing {warmup_windows} warm-up windows for {num_accounts} accounts ..."
+        )
+        for account in accounts:
+            for window in range(warmup_windows):
+                timestamp = warmup_start + timedelta(minutes=5 * window)
+                event = make_event(
+                    account,
+                    account.historical_avg,
+                    account.home_country,
+                    label=None,
+                    timestamp=timestamp,
+                )
+                event["evaluation_run_id"] = run_id
+                producer.send(topic, key=event["account_id"], value=event)
+                touch_account(account, event)
+                sent += 1
+        producer.flush()
+        print(f"Warm-up published: {sent} normal events")
 
     print(f"Publishing to topic '{topic}' on {broker} at ~{rate} events/sec (Ctrl+C to stop)")
 
@@ -256,6 +272,7 @@ def run(
                     events = velocity_burst_events(account)
 
             for event in events:
+                event["evaluation_run_id"] = run_id
                 producer.send(topic, key=event["account_id"], value=event)
                 touch_account(account, event)
                 sent += 1
@@ -294,6 +311,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--anomaly-rate", type=float, default=0.05, help="fraction of events that are anomalous")
     parser.add_argument("--duration", type=float, default=None, help="seconds to run before stopping (default: forever)")
     parser.add_argument(
+        "--warmup-windows",
+        type=int,
+        default=0,
+        help="normal 5-minute history windows per account before anomaly injection",
+    )
+    parser.add_argument(
+        "--run-id",
+        default=None,
+        help="evaluation run identifier (default: generated UUID)",
+    )
+    parser.add_argument(
         "--injection-mode", type=str, choices=["random", "borderline", "straddle"], default="random",
         help=(
             "how impossible_travel anomalies are constructed (default: random). 'random' "
@@ -319,4 +347,6 @@ if __name__ == "__main__":
         anomaly_rate=args.anomaly_rate,
         duration=args.duration,
         injection_mode=args.injection_mode,
+        warmup_windows=args.warmup_windows,
+        run_id=args.run_id,
     )

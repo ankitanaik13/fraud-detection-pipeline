@@ -44,19 +44,51 @@ services:
       timeout: 5s
       retries: 10
 
+  spark-volume-init:
+    image: alpine:3.20
+    user: "0:0"
+    command: ["sh", "-c", "chown -R 185:185 /checkpoints /ivy"]
+    restart: "no"
+    volumes:
+      - spark_checkpoints:/checkpoints
+      - spark_ivy_cache:/ivy
+
   spark:
     build: ./docker/spark
     container_name: fraud-spark
     restart: unless-stopped
     depends_on:
-      - kafka
-      - postgres
-    entrypoint: ["tail", "-f", "/dev/null"] # idle container; jobs are run via `docker compose exec spark spark-submit ...`
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      spark-volume-init:
+        condition: service_completed_successfully
+    environment:
+      KAFKA_BROKER_INTERNAL: kafka:9092
+      POSTGRES_URL: postgresql://fraud:fraud@postgres:5432/frauddb
+      PYTHONPATH: /opt/fraud-pipeline
+      # v2 state adds Welford variance; a versioned path avoids restoring an
+      # incompatible v1 Spark state schema while preserving the old checkpoint.
+      CHECKPOINT_LOCATION: /opt/fraud-pipeline/checkpoints/fraud_detector_v2_2
+      STREAM_STALL_TIMEOUT_SECONDS: ${STREAM_STALL_TIMEOUT_SECONDS:-180}
+      STREAM_RESTART_LIMIT: ${STREAM_RESTART_LIMIT:-5}
+      MAX_OFFSETS_PER_TRIGGER: ${MAX_OFFSETS_PER_TRIGGER:-1000}
+      STREAM_TRIGGER_SECONDS: ${STREAM_TRIGGER_SECONDS:-5}
+    entrypoint: ["/opt/spark/bin/spark-submit"]
+    command:
+      - --conf
+      - spark.jars.ivy=/opt/spark-ivy
+      - --packages
+      - org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.9,org.postgresql:postgresql:42.7.3
+      - /opt/fraud-pipeline/src/streaming/fraud_detector.py
     volumes:
-      - ./src:/opt/spark-apps
+      - .:/opt/fraud-pipeline
+      - spark_checkpoints:/opt/fraud-pipeline/checkpoints
       - spark_ivy_cache:/opt/spark-ivy
 
 volumes:
   kafka_data:
   postgres_data:
   spark_ivy_cache:
+  spark_checkpoints:
